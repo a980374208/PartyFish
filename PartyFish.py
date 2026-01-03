@@ -4,13 +4,55 @@ import webbrowser
 import warnings
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import threading  # For running the script in a separate thread
 import ctypes
 from pynput import keyboard, mouse  # 用于监听键盘和鼠标事件，支持热键和鼠标侧键操作 
 import datetime
 import re
 import queue  # 用于线程安全通信
+import random  # 用于添加随机延迟
+
+# Windows API常量
+WS_CAPTION = 0x00C00000  # 标题栏样式
+WS_THICKFRAME = 0x00040000  # 可调整边框样式
+GWL_STYLE = -16  # 窗口样式属性
+# Windows API常量 - DPI相关
+LOGPIXELSX = 88  # 水平DPI
+LOGPIXELSY = 90  # 垂直DPI
+# 默认DPI值
+DEFAULT_DPI = 96
+
+# 获取user32库
+user32 = ctypes.windll.user32
+
+# 定义MONITORINFO结构体
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("rcMonitor", ctypes.wintypes.RECT),
+        ("rcWork", ctypes.wintypes.RECT),
+        ("dwFlags", ctypes.wintypes.DWORD)
+    ]
+
+# 定义RECT结构体
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.wintypes.LONG),
+        ("top", ctypes.wintypes.LONG),
+        ("right", ctypes.wintypes.LONG),
+        ("bottom", ctypes.wintypes.LONG)
+    ]
+
+# =========================
+# 管理员权限检测
+# =========================
+def is_admin():
+    """检测当前程序是否以管理员权限运行"""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except:
+        return False
 
 # 过滤libpng的iCCP警告（图片ICC配置文件问题）
 warnings.filterwarnings("ignore", message=".*iCCP.*")
@@ -75,6 +117,12 @@ record_fish_enabled = True  # 默认启用钓鱼记录
 legendary_screenshot_enabled = True # 默认关闭传说/传奇鱼自动截屏
 
 # =========================
+# 钓鱼参数配置管理
+# =========================
+current_fish_config = 0  # 当前钓鱼配置索引（0-3对应4个配置）
+fish_configs = []  # 保存4个钓鱼配置
+
+# =========================
 # 字体大小设置
 # =========================
 font_size = 100  # 默认字体大小为100%
@@ -85,13 +133,24 @@ fish_tree_ref = None  # 保存钓鱼记录Treeview引用，用于动态调整列
 
 # =========================
 # 调试功能设置
-# =========================
 debug_mode = True  # 调试模式开关，默认开启
 debug_info_queue = queue.Queue(maxsize=200)  # 调试信息队列，用于线程间通信
 debug_info_history = []  # 调试信息历史记录，最多保存200条
 debug_history_lock = threading.Lock()  # 保护调试历史记录的线程锁
 debug_window = None  # 调试窗口引用
 debug_auto_refresh = True  # 是否自动刷新调试信息
+
+# 应用窗口检测设置
+is_selected_window_active = False  # 当前是否为选中的应用窗口
+selected_window_check_interval = 1.0  # 检测间隔时间（秒）
+last_selected_window_check = 0  # 上次检测的时间戳
+selected_window_check = True  # 是否启用应用窗口检测
+selected_window_first_check_done = False  # 启动检测标志，确保只在软件启动时检测一次
+selected_window_hwnd = None  # 选中的窗口句柄
+selected_window_title = ""  # 选中的窗口标题
+is_monster_party_active = False  # 当前是否为猛兽派对窗口
+
+selected_qualitys = ["标准","非凡"]  # 选中的颜色类型
 
 # =========================
 # 参数文件路径
@@ -375,6 +434,42 @@ def update_all_widget_fonts(widget, style, font_size_percent):
 # 加载和保存参数
 # =========================
 def save_parameters():
+    global fish_configs
+    
+    # 确保fish_configs有4个配置，每个配置都有name字段
+    while len(fish_configs) < 4:
+        fish_configs.append({
+            "name": f"配置 {len(fish_configs) + 1}",
+            "t": t,
+            "leftclickdown": leftclickdown,
+            "leftclickup": leftclickup,
+            "times": times,
+            "paogantime": paogantime,
+            "jiashi_var": jiashi_var,
+            "random_delay": random_delay  # 添加随机延迟参数
+        })
+    
+    # 确保每个配置都有name字段和random_delay字段
+    for i in range(4):
+        if "name" not in fish_configs[i]:
+            fish_configs[i]["name"] = f"配置 {i + 1}"
+        if "random_delay" not in fish_configs[i]:
+            fish_configs[i]["random_delay"] = random_delay
+    
+    # 更新当前配置
+    # 保留当前配置的name字段
+    current_name = fish_configs[current_fish_config].get("name", f"配置 {current_fish_config + 1}")
+    fish_configs[current_fish_config] = {
+        "name": current_name,
+        "t": t,
+        "leftclickdown": leftclickdown,
+        "leftclickup": leftclickup,
+        "times": times,
+        "paogantime": paogantime,
+        "jiashi_var": jiashi_var,
+        "random_delay": random_delay  # 添加随机延迟参数
+    }
+    
     params = {
         "t": t,
         "leftclickdown": leftclickdown,
@@ -382,13 +477,21 @@ def save_parameters():
         "times": times,
         "paogantime": paogantime,
         "jiashi_var": jiashi_var,  # 保存加时参数
+        "random_delay": random_delay,  # 保存随机延迟参数
         "resolution": resolution_choice,  # 保存分辨率选择
         "custom_width": TARGET_WIDTH,  # 保存自定义宽度
         "custom_height": TARGET_HEIGHT,  # 保存自定义高度
         "hotkey": hotkey_name,  # 保存热键设置（如 "Ctrl+Shift+A" 或 "F2"）
+        "release_hotkey": release_hotkey_name,  # 保存放生热键设置（如 "F4"）
         "record_fish_enabled": record_fish_enabled,  # 保存钓鱼记录开关状态
         "legendary_screenshot_enabled": legendary_screenshot_enabled,  # 保存传说/传奇鱼自动截屏开关状态
         "font_size": font_size,  # 保存字体大小设置
+        "fish_configs": fish_configs,  # 保存4个钓鱼配置
+        "current_fish_config": current_fish_config,  # 保存当前配置索引
+        "random_delay_enabled": random_delay_enabled,  # 保存随机延迟开关状态
+        "selected_window_check": selected_window_check,  # 保存应用窗口检测开关状态
+        "selected_window_check_interval": selected_window_check_interval,  # 保存应用窗口检测间隔
+        "selected_window_title": selected_window_title  # 保存选中的窗口标题
     }
     try:
         with open(PARAMETER_FILE, "w") as f:
@@ -398,19 +501,22 @@ def save_parameters():
         print(f"❌ [错误] 保存参数失败: {e}")
 
 def load_parameters():
-    global t, leftclickdown, leftclickup, times, paogantime, jiashi_var
+    global t, leftclickdown, leftclickup, times, paogantime, jiashi_var, random_delay
     global resolution_choice, TARGET_WIDTH, TARGET_HEIGHT, SCALE_X, SCALE_Y
-    global hotkey_name, hotkey_modifiers, hotkey_main_key
-    global font_size
+    global hotkey_name, hotkey_modifiers, hotkey_main_key, release_hotkey_name, release_hotkey_modifiers, release_hotkey_main_key
+    global font_size, fish_configs, current_fish_config
     try:
             with open(PARAMETER_FILE, "r") as f:
                 params = json.load(f)
+                # 加载基本参数
                 t = params.get("t", t)
                 leftclickdown = params.get("leftclickdown", leftclickdown)
                 leftclickup = params.get("leftclickup", leftclickup)
                 times = params.get("times", times)
                 paogantime = params.get("paogantime", paogantime)
                 jiashi_var = params.get("jiashi_var", jiashi_var)
+                # 加载随机延迟参数
+                random_delay = params.get("random_delay", random_delay)
                 resolution_choice = params.get("resolution", "2K")
                 # 加载钓鱼记录开关状态
                 global record_fish_enabled
@@ -418,6 +524,14 @@ def load_parameters():
                 # 加载传说/传奇鱼自动截屏开关状态
                 global legendary_screenshot_enabled
                 legendary_screenshot_enabled = params.get("legendary_screenshot_enabled", True)
+                # 加载随机延迟开关状态
+                global random_delay_enabled
+                random_delay_enabled = params.get("random_delay_enabled", True)  # 默认启用
+                # 加载应用窗口检测参数
+                global selected_window_check, selected_window_check_interval, selected_window_title
+                selected_window_check = params.get("selected_window_check", True)  # 默认启用
+                selected_window_check_interval = params.get("selected_window_check_interval", 1.0)  # 默认1秒
+                selected_window_title = params.get("selected_window_title", "")  # 默认空标题
                 # 加载字体大小设置
                 font_size = params.get("font_size", 100)  # 默认100%
                 # 加载热键设置（新格式支持组合键）
@@ -433,6 +547,72 @@ def load_parameters():
                     hotkey_name = "F2"
                     hotkey_modifiers = set()
                     hotkey_main_key = keyboard.Key.f2
+
+                 # 加载放生热键设置
+                saved_release_hotkey = params.get("release_hotkey", "F4")
+                try:
+                    modifiers, main_key, main_key_name = parse_hotkey_string(saved_release_hotkey)
+                    if main_key is not None:
+                        release_hotkey_name = saved_release_hotkey
+                        release_hotkey_modifiers = modifiers
+                        release_hotkey_main_key = main_key
+                except Exception:
+                    # 解析失败，使用默认值
+                    release_hotkey_name = "F4"
+                    release_hotkey_modifiers = set()
+                    release_hotkey_main_key = keyboard.Key.f4
+
+                # 加载钓鱼配置
+                loaded_configs = params.get("fish_configs", [])
+                if loaded_configs:
+                    fish_configs = loaded_configs
+                    # 确保有4个配置
+                    while len(fish_configs) < 4:
+                        fish_configs.append({
+                            "name": f"配置 {len(fish_configs) + 1}",
+                            "t": t,
+                            "leftclickdown": leftclickdown,
+                            "leftclickup": leftclickup,
+                            "times": times,
+                            "paogantime": paogantime,
+                            "jiashi_var": jiashi_var,
+                            "random_delay": random_delay
+                        })
+                    # 确保每个配置都有name字段和random_delay字段
+                    for i in range(4):
+                        if "name" not in fish_configs[i]:
+                            fish_configs[i]["name"] = f"配置 {i + 1}"
+                        if "random_delay" not in fish_configs[i]:
+                            fish_configs[i]["random_delay"] = random_delay
+                    # 加载当前配置索引
+                    current_fish_config = params.get("current_fish_config", 0)
+                    # 应用当前配置
+                    config = fish_configs[current_fish_config]
+                    t = config["t"]
+                    leftclickdown = config["leftclickdown"]
+                    leftclickup = config["leftclickup"]
+                    times = config["times"]
+                    paogantime = config["paogantime"]
+                    jiashi_var = config["jiashi_var"]
+                    random_delay = config.get("random_delay", random_delay)
+                else:
+                    # 旧格式，初始化4个配置
+                    fish_configs = []
+                    for i in range(4):
+                        fish_configs.append({
+                            "name": f"配置 {i + 1}",
+                            "t": t,
+                            "leftclickdown": leftclickdown,
+                            "leftclickup": leftclickup,
+                            "times": times,
+                            "paogantime": paogantime,
+                            "jiashi_var": jiashi_var,
+                            "random_delay": random_delay
+                        })
+                    current_fish_config = 0
+            # 获取系统缩放比例
+            system_scaling = get_system_scaling()
+            
             # 根据分辨率选择设置目标分辨率
             if resolution_choice == "1080P":
                 TARGET_WIDTH, TARGET_HEIGHT = 1920, 1080
@@ -441,8 +621,9 @@ def load_parameters():
             elif resolution_choice == "4K":
                 TARGET_WIDTH, TARGET_HEIGHT = 3840, 2160
             elif resolution_choice == "current":
-                # 使用当前系统分辨率
+                # 使用当前系统分辨率（已返回真实物理分辨率）
                 TARGET_WIDTH, TARGET_HEIGHT = get_current_screen_resolution()
+                print(f"📋 [信息] 检测到系统缩放: {system_scaling}%，使用真实分辨率: {TARGET_WIDTH}×{TARGET_HEIGHT}")
             elif resolution_choice == "自定义":
                 TARGET_WIDTH = params.get("custom_width", 2560)
                 TARGET_HEIGHT = params.get("custom_height", 1440)
@@ -454,19 +635,45 @@ def load_parameters():
             #print(f"已加载参数: 循环间隔 = {t}, 收线时间 = {leftclickdown}, 放线时间 = {leftclickup}, 最大拉杆次数 = {times}，抛竿时间 = {paogantime}, 加时 = {jiashi_var}")
     except FileNotFoundError:
         print("📄 [信息] 未找到参数文件，使用默认值")
+        # 初始化4个默认配置
+        fish_configs = []
+        for i in range(4):
+            fish_configs.append({
+                "name": f"配置 {i + 1}",
+                "t": t,
+                "leftclickdown": leftclickdown,
+                "leftclickup": leftclickup,
+                "times": times,
+                "paogantime": paogantime,
+                "jiashi_var": jiashi_var
+            })
+        current_fish_config = 0
     except Exception as e:
         print(f"❌ [错误] 加载参数失败: {e}")
+        # 初始化4个默认配置
+        fish_configs = []
+        for i in range(4):
+            fish_configs.append({
+                "name": f"配置 {i + 1}",
+                "t": t,
+                "leftclickdown": leftclickdown,
+                "leftclickup": leftclickup,
+                "times": times,
+                "paogantime": paogantime,
+                "jiashi_var": jiashi_var
+            })
+        current_fish_config = 0
 
 # =========================
 # 更新参数
 # =========================
-def update_parameters(t_var, leftclickdown_var, leftclickup_var, times_var, paogantime_var, jiashi_var_option,
-                      resolution_var, custom_width_var, custom_height_var, hotkey_var=None, record_fish_var=None,
-                      legendary_screenshot_var=None):
-    global t, leftclickdown, leftclickup, times, paogantime, jiashi_var
+def update_parameters(t_var, leftclickdown_var, leftclickup_var, times_var, paogantime_var, jiashi_var_option, random_delay_percent_var,
+                      resolution_var, custom_width_var, custom_height_var, hotkey_var=None,release_hotkey_var=None, record_fish_var=None,
+                      legendary_screenshot_var=None, random_delay_enabled_var=None):
+    global t, leftclickdown, leftclickup, times, paogantime, jiashi_var, random_delay
     global resolution_choice, TARGET_WIDTH, TARGET_HEIGHT, SCALE_X, SCALE_Y
-    global hotkey_name, hotkey_modifiers, hotkey_main_key
-    global record_fish_enabled, legendary_screenshot_enabled
+    global hotkey_name, hotkey_modifiers, hotkey_main_key, release_hotkey_name, release_hotkey_modifiers, release_hotkey_main_key
+    global record_fish_enabled, legendary_screenshot_enabled, random_delay_enabled
 
     with param_lock:  # 使用锁保护参数更新
         try:
@@ -476,6 +683,7 @@ def update_parameters(t_var, leftclickdown_var, leftclickup_var, times_var, paog
             times = int(times_var.get())
             paogantime = float(paogantime_var.get())
             jiashi_var = jiashi_var_option.get()
+            random_delay = int(random_delay_percent_var.get())  # 获取随机延迟百分比
             
             # 更新钓鱼记录开关状态
             if record_fish_var is not None:
@@ -484,6 +692,10 @@ def update_parameters(t_var, leftclickdown_var, leftclickup_var, times_var, paog
             # 更新传说/传奇鱼自动截屏开关状态
             if legendary_screenshot_var is not None:
                 legendary_screenshot_enabled = bool(legendary_screenshot_var.get())
+            
+            # 更新随机延迟开关状态
+            if random_delay_enabled_var is not None:
+                random_delay_enabled = bool(random_delay_enabled_var.get())
 
             # 更新热键设置（新格式支持组合键）
             if hotkey_var is not None:
@@ -498,8 +710,25 @@ def update_parameters(t_var, leftclickdown_var, leftclickup_var, times_var, paog
                     except Exception:
                         pass  # 保持原有热键设置
 
+            #更新放生热键设置（新格式支持组合键）
+            if release_hotkey_var is not None:
+                new_release_hotkey = release_hotkey_var.get()
+                if new_release_hotkey:
+                    try:
+                        modifiers, main_key, main_key_name = parse_hotkey_string(new_release_hotkey)
+                        if main_key is not None:
+                            release_hotkey_name = new_release_hotkey
+                            release_hotkey_modifiers = modifiers
+                            release_hotkey_main_key = main_key
+                    except Exception:
+                        pass  # 保持原有放生热键设置
+
             # 更新分辨率设置
             resolution_choice = resolution_var.get()
+            
+            # 获取系统缩放比例
+            system_scaling = get_system_scaling()
+            
             if resolution_choice == "1080P":
                 TARGET_WIDTH, TARGET_HEIGHT = 1920, 1080
             elif resolution_choice == "2K":
@@ -507,8 +736,9 @@ def update_parameters(t_var, leftclickdown_var, leftclickup_var, times_var, paog
             elif resolution_choice == "4K":
                 TARGET_WIDTH, TARGET_HEIGHT = 3840, 2160
             elif resolution_choice == "current":
-                # 使用当前系统分辨率
+                # 使用当前系统分辨率（已返回真实物理分辨率）
                 TARGET_WIDTH, TARGET_HEIGHT = get_current_screen_resolution()
+                print(f"📋 [信息] 检测到系统缩放: {system_scaling}%，使用真实分辨率: {TARGET_WIDTH}×{TARGET_HEIGHT}")
                 # 更新输入框显示，确保用户看到实际应用的值
                 custom_width_var.set(str(TARGET_WIDTH))
                 custom_height_var.set(str(TARGET_HEIGHT))
@@ -535,15 +765,16 @@ def update_parameters(t_var, leftclickdown_var, leftclickup_var, times_var, paog
             calculate_scale_factors()  # 计算所有缩放比例（包括SCALE_UNIFORM）
             update_region_coords()  # 更新区域坐标
 
-            print("┌" + "─" * 48 + "┐")
-            print("│  ⚙️  参数更新成功                              │")
-            print("├" + "─" * 48 + "┤")
+            print("┌" + "─" * 56 + "┐")
+            print("│  ⚙️  参数更新成功                                  │")
+            print("├" + "─" * 56 + "┤")
             print(f"│  ⏱️  循环间隔: {t:.1f}s    📍 收线: {leftclickdown:.1f}s    📍 放线: {leftclickup:.1f}s")
             print(f"│  🎣 最大拉杆: {times}次     ⏳ 抛竿: {paogantime:.1f}s    {'✅' if jiashi_var else '❌'} 加时: {'是' if jiashi_var else '否'}")
             print(f"│  🖥️  分辨率: {resolution_choice} ({TARGET_WIDTH}×{TARGET_HEIGHT})")
-            print(f"│  📐 缩放比例: X={SCALE_X:.2f}  Y={SCALE_Y:.2f}  统一={SCALE_UNIFORM:.2f}")
+            print(f"│  🎲 随机延迟: {'✅' if random_delay_enabled else '❌'} {random_delay}%    📐 缩放比例: X={SCALE_X:.2f}  Y={SCALE_Y:.2f}")
             print(f"│  ⌨️  热键: {hotkey_name}")
-            print("└" + "─" * 48 + "┘")
+            print(f"│  ⌨️  放生热键: {release_hotkey_name}")
+            print("└" + "─" * 56 + "┘")
             # 保存到文件
             save_parameters()
         except ValueError as e:
@@ -615,9 +846,12 @@ def show_debug_window():
         """更新分辨率信息标签"""
         max_width, max_height = get_max_screen_resolution()
         current_width, current_height = get_current_screen_resolution()  # 使用实际系统分辨率
+        actual_width, actual_height = get_actual_screen_resolution()  # 真实物理分辨率
+        system_scaling = get_system_scaling()  # 系统缩放比例
         
-        resolution_text = f"🖥️  当前分辨率: {current_width}×{current_height} | 最大分辨率: {max_width}×{max_height}\n" + \
-                          f"🖥️  缩放比例: X={SCALE_X:.2f} Y={SCALE_Y:.2f} 统一={SCALE_UNIFORM:.2f}"
+        resolution_text = f"🖥️  当前分辨率: {current_width}×{current_height} | 真实分辨率: {actual_width}×{actual_height}\n" + \
+                          f"📏 系统缩放: {system_scaling}% | 最大分辨率: {max_width}×{max_height}\n" + \
+                          f"📐 缩放比例: X={SCALE_X:.2f} Y={SCALE_Y:.2f} 统一={SCALE_UNIFORM:.2f}"
         resolution_label.configure(text=resolution_text)
     
     resolution_label = ttkb.Label(
@@ -730,6 +964,93 @@ def show_debug_window():
         bootstyle="primary-outline"
     )
     manual_ocr_btn.pack(side=RIGHT, padx=(10, 0))
+    
+    # 应用窗口检测功能
+    window_detection_frame = ttkb.Frame(control_frame, bootstyle="info")
+    window_detection_frame.pack(fill=X, pady=(10, 0))
+    
+
+    
+    # 窗口选择下拉框
+    window_list_var = ttkb.StringVar(value="选择窗口...")
+    window_list_combobox = ttkb.Combobox(
+        window_detection_frame,
+        textvariable=window_list_var,
+        width=35,
+        bootstyle="info",
+        state="readonly"
+    )
+    window_list_combobox.pack(side=LEFT, padx=5, pady=5, fill=X, expand=True)
+    
+    # 刷新窗口列表按钮
+    def refresh_window_list():
+        """刷新窗口列表"""
+        windows = get_all_windows()
+        window_titles = [title for _, title in windows]
+        window_list_combobox['values'] = window_titles
+        if window_titles:
+            window_list_var.set(window_titles[0])
+        else:
+            window_list_var.set("无可用窗口")
+    
+    window_refresh_btn = ttkb.Button(
+        window_detection_frame,
+        text="刷新",
+        command=refresh_window_list,
+        bootstyle="info",
+        width=6
+    )
+    window_refresh_btn.pack(side=LEFT, padx=5, pady=5)
+    
+    # 窗口选择变化时更新全局变量
+    def on_window_selection_change(event):
+        """窗口选择变化时更新全局变量"""
+        global selected_window_hwnd, selected_window_title
+        selected_title = window_list_var.get()
+        windows = get_all_windows()
+        for hwnd, title in windows:
+            if title == selected_title:
+                selected_window_hwnd = hwnd
+                selected_window_title = title
+                break
+    
+    window_list_combobox.bind("<<ComboboxSelected>>", on_window_selection_change)
+    
+    # 初始刷新窗口列表
+    refresh_window_list()
+    
+    # 检测选定窗口按钮
+    def on_check_selected_window():
+        """检测选定窗口样式并显示结果"""
+        result = check_window_style(selected_window_hwnd)
+        # 添加调试信息到队列
+        debug_info = {
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "action": "selected_window_detection",
+            "message": "应用窗口检测结果",
+            "ocr_result": [],
+            "parsed_info": {
+                "是否为选中窗口": "是" if result["is_selected_window"] else "否",
+                "窗口标题": result["window_title"],
+                "窗口类名": result["window_class"],
+                "窗口尺寸": f"{result['window_width']}x{result['window_height']}",
+                "显示器分辨率": f"{result['screen_width']}x{result['screen_height']}",
+                "是否无窗口边框样式": "是" if result["has_no_border"] else "否",
+                "是否尺寸匹配": "是" if result["size_match"] else "否",
+                "是否为全屏无边框窗口": "是" if result["is_fullscreen_borderless"] else "否"
+            }
+        }
+        add_debug_info(debug_info)
+        # 更新调试信息显示
+        update_debug_info()
+    
+    selected_window_btn = ttkb.Button(
+        window_detection_frame, 
+        text="检测选定窗口", 
+        command=on_check_selected_window, 
+        bootstyle="success"
+    )
+    selected_window_btn.pack(side=LEFT, padx=5, pady=5)
     
     # 刷新按钮
     refresh_btn = ttkb.Button(
@@ -1134,6 +1455,152 @@ def create_gui():
     # 绑定内容框架的Configure事件，更新滚动区域
     left_content_frame.bind("<Configure>", update_scroll_region)
 
+    # ==================== 钓鱼配置选择 ====================
+    config_frame = ttkb.Labelframe(
+        left_content_frame,
+        text=" 📋 配置选择 ",
+        padding=10,
+        bootstyle="secondary"
+    )
+    config_frame.pack(fill=X, pady=(0, 6), padx=2)
+    
+    # 配置容器列表，保存每个配置的控件
+    config_containers = []
+    
+    # 配置切换函数
+    def switch_config(config_index):
+        global current_fish_config, t, leftclickdown, leftclickup, times, paogantime, jiashi_var, random_delay
+        if 0 <= config_index < 4:
+            current_fish_config = config_index
+            # 应用配置
+            config = fish_configs[current_fish_config]
+            t = config["t"]
+            leftclickdown = config["leftclickdown"]
+            leftclickup = config["leftclickup"]
+            times = config["times"]
+            paogantime = config["paogantime"]
+            jiashi_var = config["jiashi_var"]
+            random_delay = config.get("random_delay", 30)
+            
+            # 更新输入框
+            t_var.set(str(t))
+            leftclickdown_var.set(str(leftclickdown))
+            leftclickup_var.set(str(leftclickup))
+            times_var.set(str(times))
+            paogantime_var.set(str(paogantime))
+            jiashi_var_option.set(jiashi_var)
+            random_delay_percent_var.set(str(random_delay))
+            # 更新滑块
+            random_delay_slider_var.set(random_delay)
+            
+            # 更新所有配置按钮样式
+            for i in range(4):
+                container = config_containers[i]
+                btn = container["btn"]
+                if i == current_fish_config:
+                    btn.configure(bootstyle="success")
+                else:
+                    btn.configure(bootstyle="primary-outline")
+            
+            # 更新状态提示
+            status_label.config(text=f"✅ 已切换到{fish_configs[current_fish_config]['name']}", bootstyle="success")
+            root.after(2000, lambda: status_label.config(text=f"按 {hotkey_name} 启动/暂停", bootstyle="light"))
+            root.after(2000, lambda: status_label.config(text=f"按 {release_hotkey_name} 放生", bootstyle="light"))
+    
+    # 更新配置名称函数
+    def update_config_name(config_index, new_name):
+        """更新配置名称"""
+        if 0 <= config_index < 4:
+            # 确保名称不为空
+            if not new_name.strip():
+                new_name = f"配置 {config_index + 1}"
+            # 更新配置名称
+            fish_configs[config_index]["name"] = new_name
+            # 保存配置
+            save_parameters()
+            # 更新按钮文本
+            container = config_containers[config_index]
+            btn = container["btn"]
+            btn.configure(text=new_name)
+    
+    # 创建可编辑配置按钮
+    for i in range(4):
+        # 获取配置名称
+        config_name = fish_configs[i].get("name", f"配置 {i + 1}")
+        
+        # 创建配置容器
+        config_container = ttkb.Frame(config_frame)
+        config_container.pack(side=LEFT, padx=2, fill=X, expand=True)
+        
+        # 创建配置按钮
+        config_btn = ttkb.Button(
+            config_container,
+            text=config_name,
+            command=lambda i=i: switch_config(i),
+            bootstyle="success" if i == current_fish_config else "primary-outline",
+            width=8
+        )
+        config_btn.pack(fill=X)
+        
+        # 创建编辑框（默认隐藏）
+        edit_var = ttkb.StringVar(value=config_name)
+        edit_entry = ttkb.Entry(
+            config_container,
+            textvariable=edit_var,
+            bootstyle="info",
+            justify="center"
+        )
+        
+        # 使用嵌套函数创建事件处理函数，解决闭包变量作用域问题
+        def create_event_handlers(idx, btn, entry, var):
+            # 编辑框失去焦点时保存
+            def on_edit_lost_focus(event):
+                new_name = var.get().strip()
+                update_config_name(idx, new_name)
+                # 隐藏编辑框，显示按钮
+                btn.pack(fill=X)
+                entry.pack_forget()
+            
+            # 编辑框按Enter键保存
+            def on_edit_enter(event):
+                new_name = var.get().strip()
+                update_config_name(idx, new_name)
+                # 隐藏编辑框，显示按钮
+                btn.pack(fill=X)
+                entry.pack_forget()
+            
+            # 点击按钮进入编辑模式
+            def on_btn_click(event):
+                # 如果是点击当前配置按钮，进入编辑模式
+                if idx == current_fish_config:
+                    # 更新编辑框内容
+                    var.set(fish_configs[idx]["name"])
+                    # 隐藏按钮，显示编辑框
+                    btn.pack_forget()
+                    entry.pack(fill=X)
+                    entry.focus_set()
+                else:
+                    # 切换配置
+                    switch_config(idx)
+            
+            return on_edit_lost_focus, on_edit_enter, on_btn_click
+        
+        # 创建事件处理函数
+        on_edit_lost_focus, on_edit_enter, on_btn_click = create_event_handlers(i, config_btn, edit_entry, edit_var)
+        
+        # 绑定事件处理函数
+        edit_entry.bind("<FocusOut>", on_edit_lost_focus)
+        edit_entry.bind("<Return>", on_edit_enter)
+        edit_entry.bind("<Escape>", lambda e, btn=config_btn, entry=edit_entry: (btn.pack(fill=X), entry.pack_forget()))
+        config_btn.bind("<Button-1>", on_btn_click)
+        
+        # 保存容器引用
+        config_containers.append({
+            "btn": config_btn,
+            "entry": edit_entry,
+            "var": edit_var
+        })
+    
     # ==================== 钓鱼参数卡片 ====================
     params_card = ttkb.Labelframe(
         left_content_frame,
@@ -1218,6 +1685,187 @@ def create_gui():
     )
     jiashi_no.pack(side=LEFT, padx=5)
 
+    # ==================== 随机延迟选项 ====================
+    random_delay_card = ttkb.Labelframe(
+        left_content_frame,
+        text=" 🎲 随机延迟 ",
+        padding=10,
+        bootstyle="info"
+    )
+    random_delay_card.pack(fill=X, pady=(0, 6), padx=2)
+
+    # 启用/禁用开关
+    random_delay_var = ttkb.BooleanVar(value=random_delay_enabled)
+    random_delay_enabled_frame = ttkb.Frame(random_delay_card)
+    random_delay_enabled_frame.pack(fill=X, pady=(0, 8))
+
+    random_delay_enabled_label = ttkb.Label(random_delay_enabled_frame, text="是否启用随机延迟")
+    random_delay_enabled_label.pack(side=LEFT)
+
+    random_delay_enabled_btn_frame = ttkb.Frame(random_delay_enabled_frame)
+    random_delay_enabled_btn_frame.pack(side=RIGHT)
+
+    random_delay_enabled_yes = ttkb.Radiobutton(
+        random_delay_enabled_btn_frame,
+        text="是",
+        variable=random_delay_var,
+        value=True,
+        bootstyle="success-outline-toolbutton"
+    )
+    random_delay_enabled_yes.pack(side=LEFT, padx=5)
+
+    random_delay_enabled_no = ttkb.Radiobutton(
+        random_delay_enabled_btn_frame,
+        text="否",
+        variable=random_delay_var,
+        value=False,
+        bootstyle="danger-outline-toolbutton"
+    )
+    random_delay_enabled_no.pack(side=LEFT, padx=5)
+
+    # 随机延迟百分比设置
+    random_delay_value_frame = ttkb.Frame(random_delay_card)
+    random_delay_value_frame.pack(fill=X)
+
+    # 滑块和输入框容器
+    random_delay_slider_frame = ttkb.Frame(random_delay_value_frame)
+    random_delay_slider_frame.pack(fill=X)
+
+    # 滑块标签
+    random_delay_slider_label = ttkb.Label(random_delay_slider_frame, text="随机延迟 (%):")
+    random_delay_slider_label.pack(side=LEFT, padx=(0, 5), pady=5, anchor="center")
+
+    # 滑块
+    random_delay_slider_var = ttkb.IntVar(value=random_delay)
+    random_delay_slider = ttkb.Scale(
+        random_delay_slider_frame,
+        from_=0,
+        to=30,
+        orient="horizontal",
+        variable=random_delay_slider_var,
+        bootstyle="info",
+        length=150,
+        cursor="hand2"
+    )
+    random_delay_slider.pack(side=LEFT, padx=5, expand=True, fill=X, pady=5)
+
+    # 数字输入框
+    random_delay_percent_var = ttkb.StringVar(value=str(random_delay))
+    random_delay_entry = ttkb.Entry(
+        random_delay_slider_frame,
+        textvariable=random_delay_percent_var,
+        width=5,
+        bootstyle="info",
+        justify="center"
+    )
+    random_delay_entry.pack(side=LEFT, padx=5, pady=5)
+    input_entries.append(random_delay_entry)
+
+    # ==================== 双向联动逻辑 ====================
+    # 滑块变化时更新输入框
+    def on_slider_change(*args):
+        slider_value = random_delay_slider_var.get()
+        random_delay_percent_var.set(str(slider_value))
+        # 保存参数
+        update_parameters(t_var, leftclickdown_var, leftclickup_var, times_var, 
+                        paogantime_var, jiashi_var_option, random_delay_percent_var, 
+                        resolution_var, custom_width_var, custom_height_var, 
+                        hotkey_var, record_fish_var, legendary_screenshot_var, 
+                        random_delay_var)
+    
+    # 输入框变化时更新滑块和验证范围
+    def on_entry_change(*args):
+        try:
+            entry_value = int(random_delay_percent_var.get())
+            # 限制范围在0-30之间
+            if entry_value < 0:
+                entry_value = 0
+            elif entry_value > 30:
+                entry_value = 30
+            # 更新滑块和输入框
+            random_delay_slider_var.set(entry_value)
+            random_delay_percent_var.set(str(entry_value))
+            # 保存参数
+            update_parameters(t_var, leftclickdown_var, leftclickup_var, times_var, 
+                            paogantime_var, jiashi_var_option, random_delay_percent_var, 
+                            resolution_var, custom_width_var, custom_height_var, 
+                            hotkey_var, record_fish_var, legendary_screenshot_var, 
+                            random_delay_var)
+        except ValueError:
+            # 如果输入不是数字，不做处理
+            pass
+    
+    # 输入框失去焦点时验证和修正值
+    def on_entry_focus_out(event):
+        try:
+            entry_value = int(random_delay_percent_var.get())
+            # 限制范围在0-30之间
+            if entry_value < 0:
+                entry_value = 0
+            elif entry_value > 30:
+                entry_value = 30
+            # 更新滑块和输入框
+            random_delay_slider_var.set(entry_value)
+            random_delay_percent_var.set(str(entry_value))
+        except ValueError:
+            # 如果输入不是数字，设为默认值0
+            random_delay_slider_var.set(0)
+            random_delay_percent_var.set("0")
+    
+    # 绑定事件
+    random_delay_slider_var.trace_add("write", on_slider_change)
+    random_delay_percent_var.trace_add("write", on_entry_change)
+    random_delay_entry.bind("<FocusOut>", on_entry_focus_out)
+    random_delay_entry.bind("<Return>", on_entry_focus_out)
+
+
+     # ==================== 放生按钮和多选框 ====================
+    # 放在左侧面板合适位置，比如在params_card之后
+    filter_card = ttkb.Labelframe(
+        left_content_frame,
+        text=" 🏷️放生品质 ",
+        padding=10,
+        bootstyle="info"
+    )
+    filter_card.pack(fill=X, pady=(0, 6), padx=2)
+
+    # 筛选按钮
+    def on_filter_btn_click():
+        # 这里可以根据实际需求处理筛选逻辑
+        global selected_qualitys
+        selected_qualitys = [q for q, var in filter_vars.items() if var.get()]
+        print("已选品质：", selected_qualitys)
+        # 你可以在这里调用刷新钓鱼记录的函数，并传递selected
+
+    filter_btn = ttkb.Button(
+        filter_card,
+        text="确认筛选放生品质",
+        command=on_filter_btn_click,
+        bootstyle="primary"
+    )
+    filter_btn.pack(fill=X, pady=(0, 8))
+
+    # 多选框变量
+    filter_vars = {
+        "标准": ttkb.BooleanVar(value=True),
+        "非凡": ttkb.BooleanVar(value=True),
+        "稀有": ttkb.BooleanVar(value=False),
+        "史诗": ttkb.BooleanVar(value=False),
+        "传说": ttkb.BooleanVar(value=False),
+    }
+
+    # 多选框布局
+    for q in ["标准", "非凡", "稀有", "史诗", "传说"]:
+        cb = ttkb.Checkbutton(
+            filter_card,
+            text=q,
+            variable=filter_vars[q],
+            bootstyle="info"
+        )
+        if q == "标准":
+            cb.config(state="disabled")
+        cb.pack(anchor="w", padx=10)
+
     # ==================== 热键设置卡片 ====================
     hotkey_card = ttkb.Labelframe(
         left_content_frame,
@@ -1229,6 +1877,7 @@ def create_gui():
 
     # 热键显示变量
     hotkey_var = ttkb.StringVar(value=hotkey_name)
+    release_hotkey_var = ttkb.StringVar(value=release_hotkey_name)
 
     # 热键捕获状态
     is_capturing_hotkey = [False]  # 使用列表以便在闭包中修改
@@ -1240,8 +1889,16 @@ def create_gui():
     hotkey_frame = ttkb.Frame(hotkey_card)
     hotkey_frame.pack(fill=X)
 
+
     hotkey_label = ttkb.Label(hotkey_frame, text="启动/暂停热键")
     hotkey_label.pack(side=LEFT)
+
+    release_hotkey_frame = ttkb.Frame(hotkey_card)
+    release_hotkey_frame.pack(fill=X)
+
+
+    release_hotkey_label = ttkb.Label(release_hotkey_frame, text="放生热键")
+    release_hotkey_label.pack(side=LEFT)
 
     # 热键显示按钮（点击后进入捕获模式）
     hotkey_btn = ttkb.Button(
@@ -1251,11 +1908,19 @@ def create_gui():
         width=12
     )
     hotkey_btn.pack(side=RIGHT)
+    # 放生热键显示按钮
+    release_hotkey_btn = ttkb.Button(
+        release_hotkey_frame,
+        text=release_hotkey_name,
+        bootstyle="primary-outline",
+        width=12
+    )
+    release_hotkey_btn.pack(side=RIGHT)
 
     # 热键信息提示（合并显示，点击按钮时会变化）
     hotkey_info_label = ttkb.Label(
         hotkey_card,
-        text=f"按 {hotkey_name} 启动/暂停 | 点击按钮修改",
+        text=f"按 {hotkey_name} 启动/暂停|{release_hotkey_name}放生|点击按钮修改",
         bootstyle="info"
     )
     hotkey_info_label.pack(pady=(3, 0))
@@ -1287,13 +1952,18 @@ def create_gui():
                     pass
             globals()['mouse_capture_listener'] = None
         hotkey_btn.configure(bootstyle="info-outline")
+        release_hotkey_btn.configure(bootstyle="info-outline")
         hotkey_tip_label.pack_forget()  # 隐藏提示
-        hotkey_info_label.configure(text=f"按 {hotkey_var.get()} 启动/暂停 | 点击按钮修改")
+        hotkey_info_label.configure(text=f"点击按钮修改热键")
 
     def on_capture_key_press(key):
         """捕获按键按下事件"""
         if not is_capturing_hotkey[0]:
             return False  # 停止监听
+
+         # 添加一个全局变量来跟踪当前捕获的按钮
+        if not hasattr(on_capture_key_press, 'current_button_name'):
+            on_capture_key_press.current_button_name = None
 
         # 检查是否是修饰键
         if key in MODIFIER_KEYS:
@@ -1307,7 +1977,12 @@ def create_gui():
             if 'shift' in captured_modifiers[0]:
                 display_parts.append('Shift')
             display_parts.append('...')
-            root.after(0, lambda: hotkey_btn.configure(text='+'.join(display_parts)))
+            def update_button_display():
+                if on_capture_key_press.current_button_name == "hotkey":
+                    hotkey_btn.configure(text='+'.join(display_parts))
+                elif on_capture_key_press.current_button_name == "release_hotkey":
+                    release_hotkey_btn.configure(text='+'.join(display_parts))
+            root.after(0, update_button_display)
             return True
 
         # 这是主按键
@@ -1319,8 +1994,13 @@ def create_gui():
 
         # 更新GUI
         def update_gui():
-            hotkey_var.set(new_hotkey)
-            hotkey_btn.configure(text=new_hotkey)
+            if on_capture_key_press.current_button_name == "hotkey":
+                hotkey_var.set(new_hotkey)
+                hotkey_btn.configure(text=new_hotkey)
+            elif on_capture_key_press.current_button_name == "release_hotkey":
+                release_hotkey_var.set(new_hotkey)
+                release_hotkey_btn.configure(text=new_hotkey)
+        
             hotkey_info_label.configure(text=f"新热键: {new_hotkey} | 点击保存生效")
             stop_hotkey_capture()
 
@@ -1354,14 +2034,18 @@ def create_gui():
         
         # 更新GUI
         def update_gui():
-            hotkey_var.set(new_hotkey)
-            hotkey_btn.configure(text=new_hotkey)
+            if on_capture_key_press.current_button_name == "hotkey":
+                hotkey_var.set(new_hotkey)
+                hotkey_btn.configure(text=new_hotkey)
+            elif on_capture_key_press.current_button_name == "release_hotkey":
+                release_hotkey_var.set(new_hotkey)
+                release_hotkey_btn.configure(text=new_hotkey)
             hotkey_info_label.configure(text=f"新热键: {new_hotkey} | 点击保存生效")
             stop_hotkey_capture()
-        
+
         root.after(0, update_gui)
 
-    def start_hotkey_capture():
+    def start_hotkey_capture(source_btn_name):
         """开始热键捕获"""
         if is_capturing_hotkey[0]:
             stop_hotkey_capture()
@@ -1372,10 +2056,18 @@ def create_gui():
         captured_main_key[0] = None
         captured_main_key_name[0] = ""
 
-        hotkey_btn.configure(text="请按键...", bootstyle="warning")
-        hotkey_info_label.configure(text="按下组合键（如Ctrl+F2）或单键/鼠标侧键")
+          # 设置当前捕获的按钮名称
+        on_capture_key_press.current_button_name = source_btn_name
+
+        if source_btn_name == "hotkey":
+            hotkey_btn.configure(text="请按键...", bootstyle="warning")
+            hotkey_info_label.configure(text="按下组合键（如Ctrl+F2）或单键/鼠标侧键")
+        elif source_btn_name == "release_hotkey":
+            release_hotkey_btn.configure(text="请按键...", bootstyle="warning")
+            hotkey_info_label.configure(text="按下释放热键（如Ctrl+F3）或单键/鼠标侧键")
+
         hotkey_tip_label.configure(text="5秒内按键，或再次点击取消")
-        hotkey_tip_label.pack(pady=(2, 0))  # 显示提示
+        hotkey_tip_label.pack(pady=(2, 0))
 
         # 启动键盘监听器
         capture_listener[0] = keyboard.Listener(
@@ -1393,11 +2085,22 @@ def create_gui():
         # 5秒后自动取消
         def auto_cancel():
             if is_capturing_hotkey[0]:
-                root.after(0, lambda: hotkey_btn.configure(text=hotkey_var.get()))
-                stop_hotkey_capture()
+                 if source_btn_name == "hotkey":
+                    current_value = hotkey_var.get()
+                    if not current_value or current_value == "未设置":
+                        current_value = "未设置"
+                    root.after(0, lambda: hotkey_btn.configure(text=current_value))
+                 elif source_btn_name == "release_hotkey":
+                    current_value = release_hotkey_var.get()
+                    if not current_value or current_value == "未设置":
+                        current_value = "未设置"
+                    root.after(0, lambda: release_hotkey_btn.configure(text=current_value))
+                 stop_hotkey_capture()
+        
         root.after(5000, auto_cancel)
 
-    hotkey_btn.configure(command=start_hotkey_capture)
+    hotkey_btn.configure(command=lambda: start_hotkey_capture("hotkey"))
+    release_hotkey_btn.configure(command=lambda: start_hotkey_capture("release_hotkey"))
 
     # ==================== 分辨率设置卡片 ====================
     resolution_card = ttkb.Labelframe(
@@ -1434,7 +2137,9 @@ def create_gui():
     custom_height_entry.pack(side=LEFT)
 
     # 当前分辨率信息标签
-    resolution_info_var = ttkb.StringVar(value=f"当前: {TARGET_WIDTH}×{TARGET_HEIGHT}")
+    resolution_info_var = ttkb.StringVar(
+        value=f"当前: {TARGET_WIDTH}×{TARGET_HEIGHT} | 系统缩放: {get_system_scaling()}%"
+    )
     info_label = ttkb.Label(
         resolution_card,
         textvariable=resolution_info_var,
@@ -1443,18 +2148,21 @@ def create_gui():
 
     def update_resolution_info():
         res = resolution_var.get()
+        # 获取系统缩放比例
+        system_scaling = get_system_scaling()
+        
         if res == "1080P":
-            resolution_info_var.set("当前: 1920×1080")
+            resolution_info_var.set(f"当前: 1920×1080 | 系统缩放: {system_scaling}%")
         elif res == "2K":
-            resolution_info_var.set("当前: 2560×1440")
+            resolution_info_var.set(f"当前: 2560×1440 | 系统缩放: {system_scaling}%")
         elif res == "4K":
-            resolution_info_var.set("当前: 3840×2160")
+            resolution_info_var.set(f"当前: 3840×2160 | 系统缩放: {system_scaling}%")
         elif res == "current":
             # 显示当前系统分辨率
             current_width, current_height = get_current_screen_resolution()
-            resolution_info_var.set(f"当前: {current_width}×{current_height}")
+            resolution_info_var.set(f"当前: {current_width}×{current_height} | 系统缩放: {system_scaling}%")
         else:
-            resolution_info_var.set(f"当前: {custom_width_var.get()}×{custom_height_var.get()}")
+            resolution_info_var.set(f"当前: {custom_width_var.get()}×{custom_height_var.get()} | 系统缩放: {system_scaling}%")
 
     def on_resolution_change():
         """当分辨率选择改变时，更新自定义输入框状态"""
@@ -2232,9 +2940,9 @@ def create_gui():
         """更新参数并刷新显示"""
         update_parameters(
             t_var, leftclickdown_var, leftclickup_var, times_var,
-            paogantime_var, jiashi_var_option, resolution_var,
+            paogantime_var, jiashi_var_option, random_delay_percent_var, resolution_var,
             custom_width_var, custom_height_var, hotkey_var, record_fish_var,
-            legendary_screenshot_var
+            legendary_screenshot_var, random_delay_var
         )
         resolution_info_var.set(f"当前: {TARGET_WIDTH}×{TARGET_HEIGHT}")
         hotkey_info_label.config(text=f"按 {hotkey_name} 启动/暂停 | 点击按钮修改")
@@ -2278,7 +2986,7 @@ def create_gui():
 
     version_label = ttkb.Label(
         status_frame,
-        text="v2.7 | PartyFish",
+        text="v2.8 | PartyFish",
         bootstyle="light"
     )
     version_label.pack(pady=(2, 0))
@@ -2389,6 +3097,36 @@ def create_gui():
     # 调用窗口大小变化处理函数，确保初始列宽设置正确
     on_window_resize(DummyEvent(root.winfo_width()))
     
+    # 软件启动时的一次应用窗口检测
+    def perform_startup_window_check():
+        global is_selected_window_active, selected_window_first_check_done
+        if not selected_window_first_check_done:
+            # 使用当前活动窗口进行检测
+            result = check_window_style()
+            is_selected_window_active = result['is_fullscreen_borderless']
+            selected_window_first_check_done = True
+            # 添加调试信息
+            debug_info = {
+                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                "action": "selected_window_detection",
+                "message": "应用窗口检测结果",
+                "ocr_result": [],
+                "parsed_info": {
+                    "是否为选中窗口": "是" if result["is_selected_window"] else "否",
+                    "窗口标题": result["window_title"],
+                    "窗口类名": result["window_class"],
+                    "窗口尺寸": f"{result['window_width']}x{result['window_height']}",
+                    "显示器分辨率": f"{result['screen_width']}x{result['screen_height']}",
+                    "是否无窗口边框样式": "是" if result["has_no_border"] else "否",
+                    "是否尺寸匹配": "是" if result["size_match"] else "否",
+                    "是否为全屏无边框窗口": "是" if result["is_fullscreen_borderless"] else "否"
+                }
+            }
+            add_debug_info(debug_info)
+    
+    # 执行启动检测
+    perform_startup_window_check()
+    
     # 运行 GUI
     root.mainloop()
 # =========================
@@ -2400,6 +3138,8 @@ leftclickdown = 2.5  # 鼠标左键按下去的时间（秒）
 leftclickup = 2  # 鼠标左键抬起的时间（秒）
 times = 15 #最大钓鱼拉杆次数
 paogantime = 0.5
+random_delay = 30  # 随机延迟百分比，0-30%，用户可自定义
+random_delay_enabled = True  # 默认启用随机延迟
 # =========================
 # 分辨率设置（修改此处适配不同分辨率）
 # =========================
@@ -2542,7 +3282,7 @@ def update_region_coords():
 # =========================
 # 参数设置
 # =========================
-template_folder_path = os.path.join('.', 'resources')
+template_folder_path = os.path.join(os.path.dirname(__file__), 'resources')
 
 # =========================
 # 钓鱼记录系统
@@ -2683,14 +3423,27 @@ def capture_fish_info_region(scr_param=None):
             add_debug_info(debug_info)
         return None
 
+    # 获取主显示器信息，确保只在主显示器上截图
+    monitor = current_scr.monitors[1]  # 1 表示主显示器
+    
     # 根据分辨率缩放坐标
     x1, y1, x2, y2 = FISH_INFO_REGION_BASE
-    region = (
-        int(x1 * SCALE_X),
-        int(y1 * SCALE_Y),
-        int(x2 * SCALE_X),
-        int(y2 * SCALE_Y)
-    )
+    scaled_x1 = int(x1 * SCALE_X)
+    scaled_y1 = int(y1 * SCALE_Y)
+    scaled_x2 = int(x2 * SCALE_X)
+    scaled_y2 = int(y2 * SCALE_Y)
+    
+    # 确保区域在主显示器范围内
+    actual_x1 = max(monitor['left'], scaled_x1)
+    actual_y1 = max(monitor['top'], scaled_y1)
+    actual_x2 = min(monitor['left'] + monitor['width'], scaled_x2)
+    actual_y2 = min(monitor['top'] + monitor['height'], scaled_y2)
+    
+    # 重新计算宽度和高度，确保有效
+    actual_w = max(1, actual_x2 - actual_x1)
+    actual_h = max(1, actual_y2 - actual_y1)
+    
+    region = (actual_x1, actual_y1, actual_x2, actual_y2)
 
     try:
         frame = current_scr.grab(region)
@@ -3195,6 +3948,10 @@ JIASHI_REGION_BASE = (1245, 675, 26, 27)
 # 点击按钮位置（基准值）
 BTN_NO_JIASHI_BASE = (1182, 776)   # 不加时按钮
 BTN_YES_JIASHI_BASE = (1398, 776)  # 加时按钮
+#鱼桶区域（基准值）
+FISH_BUCKET_REGION_BASE = (1865, 510, 590, 700)   #鱼桶区域
+FISH_BUCKET_LABEL_REGION_BASE = (2143, 410, 106, 49)   #鱼桶标签区域
+
 previous_result = None  # 上次识别的结果
 current_result = 0  # 当前识别的数字
 # 模板加载一次
@@ -3210,39 +3967,499 @@ _cached_scale_x = None
 _cached_scale_y = None
 run_event = threading.Event()
 begin_event = threading.Event()
+fish_bucket_run_event = threading.Event()
 user32 = ctypes.WinDLL("user32")
 listener = None #监听
 hotkey_name = "F2"  # 默认热键显示名称
 hotkey_modifiers = set()  # 修饰键集合 (ctrl, alt, shift)
-hotkey_main_key = keyboard.Key.f2  # 主按键对象
+hotkey_main_key = keyboard.Key.f4  # 主按键对象
+release_hotkey_name = "F4"  # 默认热键显示名称
+release_hotkey_modifiers = set()  # 修饰键集合 (ctrl, alt, shift)
+release_hotkey_main_key = keyboard.Key.f4  # 主按键对象
 
-# 获取当前系统分辨率
+#定义放生模板
+# release_biaozun = None
+release_feifan = None
+release_xiyou = None
+release_shishi = None
+release_chuanshuo = None
+release_bucket_label = None
+
+
+
+# 获取当前系统分辨率（考虑系统缩放）
 def get_current_screen_resolution():
     """
-    获取当前系统的屏幕分辨率
+    获取当前系统的屏幕分辨率（不考虑系统缩放，返回真实物理分辨率）
     返回: (width, height) 元组
     """
     try:
-        # 获取主显示器的分辨率
-        width = user32.GetSystemMetrics(0)  # SM_CXSCREEN = 0
-        height = user32.GetSystemMetrics(1)  # SM_CYSCREEN = 1
-        return width, height
+        # 直接返回真实物理分辨率，不考虑系统缩放
+        actual_width, actual_height = get_actual_screen_resolution()
+        return actual_width, actual_height
     except Exception as e:
         print(f"❌ [错误] 获取屏幕分辨率失败: {e}")
         return TARGET_WIDTH, TARGET_HEIGHT
 
-# 获取当前系统分辨率
+# 获取系统缩放比例（百分比）
+def get_system_scaling():
+    """
+    获取系统缩放比例（百分比）
+    返回: 缩放百分比，如100, 125, 150等
+    """
+    try:
+        # 获取设备上下文
+        dc = user32.GetDC(0)
+        if dc is None:
+            return 100
+        
+        # 获取水平DPI
+        dpi_x = ctypes.windll.gdi32.GetDeviceCaps(dc, LOGPIXELSX)
+        
+        # 释放设备上下文
+        user32.ReleaseDC(0, dc)
+        
+        # 默认DPI是96，计算缩放百分比
+        scaling = int(dpi_x / DEFAULT_DPI * 100)
+        return scaling
+    except Exception as e:
+        print(f"❌ [错误] 获取系统缩放失败: {e}")
+        return 100
+
+# 获取真实屏幕分辨率（不考虑系统缩放）
+def get_actual_screen_resolution():
+    """
+    获取真实物理屏幕分辨率（不考虑系统缩放）
+    返回: (width, height) 元组
+    """
+    try:
+        # 使用EnumDisplaySettings获取真实分辨率
+        class DEVMODE(ctypes.Structure):
+            _fields_ = [
+                ("dmDeviceName", ctypes.c_wchar * 32),
+                ("dmSpecVersion", ctypes.wintypes.WORD),
+                ("dmDriverVersion", ctypes.wintypes.WORD),
+                ("dmSize", ctypes.wintypes.WORD),
+                ("dmDriverExtra", ctypes.wintypes.WORD),
+                ("dmFields", ctypes.wintypes.DWORD),
+                ("dmPositionX", ctypes.wintypes.LONG),
+                ("dmPositionY", ctypes.wintypes.LONG),
+                ("dmDisplayOrientation", ctypes.wintypes.DWORD),
+                ("dmDisplayFixedOutput", ctypes.wintypes.DWORD),
+                ("dmColor", ctypes.wintypes.WORD),
+                ("dmDuplex", ctypes.wintypes.WORD),
+                ("dmYResolution", ctypes.wintypes.WORD),
+                ("dmTTOption", ctypes.wintypes.WORD),
+                ("dmCollate", ctypes.wintypes.WORD),
+                ("dmFormName", ctypes.c_wchar * 32),
+                ("dmLogPixels", ctypes.wintypes.WORD),
+                ("dmBitsPerPel", ctypes.wintypes.DWORD),
+                ("dmPelsWidth", ctypes.wintypes.DWORD),
+                ("dmPelsHeight", ctypes.wintypes.DWORD),
+                ("dmDisplayFlags", ctypes.wintypes.DWORD),
+                ("dmDisplayFrequency", ctypes.wintypes.DWORD),
+                ("dmICMMethod", ctypes.wintypes.DWORD),
+                ("dmICMIntent", ctypes.wintypes.DWORD),
+                ("dmMediaType", ctypes.wintypes.DWORD),
+                ("dmDitherType", ctypes.wintypes.DWORD),
+                ("dmReserved1", ctypes.wintypes.DWORD),
+                ("dmReserved2", ctypes.wintypes.DWORD),
+                ("dmPanningWidth", ctypes.wintypes.DWORD),
+                ("dmPanningHeight", ctypes.wintypes.DWORD),
+            ]
+        
+        devmode = DEVMODE()
+        devmode.dmSize = ctypes.sizeof(DEVMODE)
+        
+        # 获取当前显示设置
+        if ctypes.windll.user32.EnumDisplaySettingsW(None, -1, ctypes.byref(devmode)):
+            # 注意：dmPelsWidth是宽度，dmPelsHeight是高度
+            actual_width = devmode.dmPelsWidth
+            actual_height = devmode.dmPelsHeight
+            
+            # 添加合理性检查，确保分辨率有效
+            if actual_width >= 800 and actual_height >= 600:
+                return actual_width, actual_height
+            else:
+                print(f"⚠️  [警告] 检测到无效分辨率: {actual_width}×{actual_height}，尝试使用备选方案")
+        
+        # 如果获取失败或分辨率无效，使用默认分辨率或直接调用Windows API获取
+        try:
+            # 使用GetSystemMetrics获取当前分辨率
+            width = user32.GetSystemMetrics(0)  # SM_CXSCREEN = 0
+            height = user32.GetSystemMetrics(1)  # SM_CYSCREEN = 1
+            
+            # 再次检查合理性
+            if width >= 800 and height >= 600:
+                return width, height
+            else:
+                print(f"⚠️  [警告] 备选方案返回无效分辨率: {width}×{height}，使用默认分辨率")
+        except Exception as e:
+            print(f"❌ [错误] 获取分辨率失败: {e}，使用默认分辨率")
+        
+        # 如果所有方法都失败，返回默认分辨率
+        return BASE_WIDTH, BASE_HEIGHT
+    except Exception as e:
+        print(f"❌ [错误] 获取真实分辨率失败: {e}")
+        try:
+            # 使用GetSystemMetrics作为备选方案
+            width = user32.GetSystemMetrics(0)
+            height = user32.GetSystemMetrics(1)
+            
+            if width >= 800 and height >= 600:
+                return width, height
+            else:
+                print(f"⚠️  [警告] 错误处理中返回无效分辨率: {width}×{height}，使用默认分辨率")
+        except Exception as e2:
+            print(f"❌ [错误] 错误处理中获取分辨率失败: {e2}，使用默认分辨率")
+        
+        # 所有方法都失败，返回默认分辨率
+        return BASE_WIDTH, BASE_HEIGHT
+
+# 获取当前系统分辨率（真实物理分辨率）
 CURRENT_SCREEN_WIDTH, CURRENT_SCREEN_HEIGHT = get_current_screen_resolution()
+
+# 获取系统缩放比例
+initial_system_scaling = get_system_scaling()
 
 # 如果分辨率选择为"current"，则更新目标分辨率为当前系统分辨率
 if resolution_choice == "current":
-    TARGET_WIDTH = CURRENT_SCREEN_WIDTH
-    TARGET_HEIGHT = CURRENT_SCREEN_HEIGHT
+    # 直接使用真实物理分辨率，无需额外处理
+    TARGET_WIDTH, TARGET_HEIGHT = CURRENT_SCREEN_WIDTH, CURRENT_SCREEN_HEIGHT
     # 重新计算缩放比例
     SCALE_X = TARGET_WIDTH / BASE_WIDTH
     SCALE_Y = TARGET_HEIGHT / BASE_HEIGHT
     # 计算统一缩放比例
     calculate_scale_factors()
+
+def get_monitor_info(hwnd):
+    """
+    获取窗口所在显示器的分辨率
+    
+    Args:
+        hwnd: 窗口句柄
+        
+    Returns:
+        (width, height): 显示器分辨率
+    """
+    try:
+        # 获取窗口所在的显示器句柄
+        monitor_hwnd = user32.MonitorFromWindow(hwnd, 0)
+        
+        # 初始化MONITORINFO结构体
+        monitor_info = MONITORINFO()
+        monitor_info.cbSize = ctypes.sizeof(MONITORINFO)
+        
+        # 获取显示器信息
+        if user32.GetMonitorInfoW(monitor_hwnd, ctypes.byref(monitor_info)):
+            # 计算显示器分辨率
+            width = monitor_info.rcMonitor.right - monitor_info.rcMonitor.left
+            height = monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top
+            return width, height
+        else:
+            # 获取失败，返回当前系统分辨率
+            return get_current_screen_resolution()
+    except Exception as e:
+        print(f"❌ [错误] 获取显示器信息失败: {e}")
+        # 获取失败，返回当前系统分辨率
+        return get_current_screen_resolution()
+
+def is_fullscreen_borderless_window(hwnd):
+    """
+    判断窗口是否为全屏无边框窗口
+    
+    Args:
+        hwnd: 窗口句柄
+        
+    Returns:
+        bool: True表示是全屏无边框窗口，False表示不是
+    """
+    # 步骤3：获取显示器分辨率和窗口尺寸
+    screen_width, screen_height = get_monitor_info(hwnd)
+    if screen_width == 0 or screen_height == 0:
+        return False
+    
+    # 获取窗口边界矩形（含边框、标题栏，屏幕坐标）
+    window_rect = RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(window_rect)):
+        return False
+    
+    window_width = window_rect.right - window_rect.left
+    window_height = window_rect.bottom - window_rect.top
+    
+    # 步骤4：验证窗口样式（无标题栏、无边框，排除手动拉满窗口的情况）
+    window_style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+    if window_style == 0:
+        return False
+    
+    # 无WS_CAPTION（标题栏）且无WS_THICKFRAME（可调整边框）
+    has_no_border = (window_style & (WS_CAPTION | WS_THICKFRAME)) == 0
+    
+    # 步骤5：尺寸对比（允许±2像素容差，适配部分游戏的微小偏差）
+    TOLERANCE = 2
+    size_match = (abs(window_width - screen_width) <= TOLERANCE) and \
+                 (abs(window_height - screen_height) <= TOLERANCE)
+    
+    # 最终判断：尺寸匹配 + 无窗口边框样式
+    return size_match and has_no_border
+
+def get_foreground_window():
+    """
+    获取当前活动窗口句柄
+    
+    Returns:
+        hwnd: 当前活动窗口句柄
+    """
+    try:
+        return user32.GetForegroundWindow()
+    except Exception as e:
+        print(f"❌ [错误] 获取当前活动窗口失败: {e}")
+        return None
+
+def find_window(title):
+    """
+    根据窗口标题查找特定窗口句柄
+    
+    Args:
+        title: 窗口标题
+        
+    Returns:
+        hwnd: 窗口句柄，如果未找到则返回None
+    """
+    try:
+        return user32.FindWindowW(None, title)
+    except Exception as e:
+        print(f"❌ [错误] 查找窗口失败: {e}")
+        return None
+
+def get_window_title(hwnd):
+    """
+    获取窗口标题
+    
+    Args:
+        hwnd: 窗口句柄
+        
+    Returns:
+        str: 窗口标题
+    """
+    try:
+        # 先获取窗口标题的长度
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return ""
+        
+        # 创建缓冲区并获取窗口标题
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        return buffer.value
+    except Exception as e:
+        print(f"❌ [错误] 获取窗口标题失败: {e}")
+        return ""
+
+def get_window_class(hwnd):
+    """
+    获取窗口类名
+    
+    Args:
+        hwnd: 窗口句柄
+        
+    Returns:
+        str: 窗口类名
+    """
+    try:
+        # 创建缓冲区并获取窗口类名
+        buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buffer, 256)
+        return buffer.value
+    except Exception as e:
+        print(f"❌ [错误] 获取窗口类名失败: {e}")
+        return ""
+
+def get_all_windows():
+    """
+    获取当前所有打开的可见窗口，返回窗口句柄和标题的列表
+    
+    Returns:
+        list: 包含元组(hwnd, window_title)的列表
+    """
+    windows = []
+    
+    def enum_windows_proc(hwnd, lParam):
+        if user32.IsWindowVisible(hwnd):
+            window_title = get_window_title(hwnd)
+            if window_title:
+                windows.append((hwnd, window_title))
+        return True
+    
+    # 定义回调函数类型
+    enum_windows_proc_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    # 调用EnumWindows获取所有窗口
+    user32.EnumWindows(enum_windows_proc_type(enum_windows_proc), 0)
+    return windows
+
+def check_window_style(hwnd=None):
+    """
+    检测指定窗口样式和尺寸，如果没有指定窗口句柄，则使用当前活动窗口
+    
+    Args:
+        hwnd: 窗口句柄，默认为None（当前活动窗口）
+        
+    Returns:
+        dict: 检测结果，包含以下字段：
+            - is_selected_window: 是否为选中的窗口
+            - window_title: 窗口标题
+            - window_class: 窗口类名
+            - is_fullscreen_borderless: 是否为全屏无边框窗口
+            - has_no_border: 是否无窗口边框样式
+            - size_match: 是否尺寸匹配
+            - window_width: 窗口宽度
+            - window_height: 窗口高度
+            - screen_width: 显示器宽度
+            - screen_height: 显示器高度
+    """
+    try:
+        # 如果没有指定窗口句柄，使用当前活动窗口
+        if hwnd is None:
+            hwnd = get_foreground_window()
+        
+        if hwnd is None:
+            return {
+                "is_selected_window": False,
+                "window_title": "",
+                "window_class": "",
+                "is_fullscreen_borderless": False,
+                "has_no_border": False,
+                "size_match": False,
+                "window_width": 0,
+                "window_height": 0,
+                "screen_width": 0,
+                "screen_height": 0
+            }
+        
+        # 获取窗口标题和类名
+        window_title = get_window_title(hwnd)
+        window_class = get_window_class(hwnd)
+        
+        # 获取显示器分辨率
+        screen_width, screen_height = get_monitor_info(hwnd)
+        
+        # 获取窗口边界矩形
+        window_rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(window_rect)):
+            return {
+                "is_selected_window": False,
+                "window_title": window_title,
+                "window_class": window_class,
+                "is_fullscreen_borderless": False,
+                "has_no_border": False,
+                "size_match": False,
+                "window_width": 0,
+                "window_height": 0,
+                "screen_width": screen_width,
+                "screen_height": screen_height
+            }
+        
+        # 计算窗口尺寸
+        window_width = window_rect.right - window_rect.left
+        window_height = window_rect.bottom - window_rect.top
+        
+        # 判断窗口样式
+        window_style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+        has_no_border = (window_style & (WS_CAPTION | WS_THICKFRAME)) == 0
+        
+        # 判断尺寸匹配
+        TOLERANCE = 2
+        size_match = (abs(window_width - screen_width) <= TOLERANCE) and \
+                     (abs(window_height - screen_height) <= TOLERANCE)
+        
+        # 判断是否为全屏无边框窗口
+        is_fullscreen_borderless = size_match and has_no_border
+        
+        return {
+            "is_selected_window": True,
+            "window_title": window_title,
+            "window_class": window_class,
+            "is_fullscreen_borderless": is_fullscreen_borderless,
+            "has_no_border": has_no_border,
+            "size_match": size_match,
+            "window_width": window_width,
+            "window_height": window_height,
+            "screen_width": screen_width,
+            "screen_height": screen_height
+        }
+    except Exception as e:
+        print(f"❌ [错误] 检测窗口样式失败: {e}")
+        return {
+            "is_selected_window": False,
+            "window_title": "",
+            "window_class": "",
+            "is_fullscreen_borderless": False,
+            "has_no_border": False,
+            "size_match": False,
+            "window_width": 0,
+            "window_height": 0,
+            "screen_width": 0,
+            "screen_height": 0
+        }
+
+def test_monster_party_detection():
+    """
+    测试猛兽派对窗口检测功能
+    """
+    global is_monster_party_active
+    
+    print("=== 测试猛兽派对窗口检测功能 ===")
+    
+    # 检测当前窗口
+    result = check_window_style()
+    
+    # 模拟猛兽派对窗口检测（实际应该根据窗口标题或其他特征判断）
+    # 这里简单地假设全屏无边框窗口就是猛兽派对窗口
+    is_monster_party = result['is_fullscreen_borderless']
+    result['is_monster_party'] = is_monster_party
+    
+    # 更新全局变量
+    is_monster_party_active = is_monster_party
+    
+    print(f"\n📋 检测结果:")
+    print(f"🎮 是否为猛兽派对窗口: {'✅' if is_monster_party else '❌'}")
+    print(f"🪟 窗口标题: {result['window_title']}")
+    print(f"🏷️  窗口类名: {result['window_class']}")
+    print(f"📏 窗口尺寸: {result['window_width']}x{result['window_height']}")
+    print(f"🖥️  显示器分辨率: {result['screen_width']}x{result['screen_height']}")
+    print(f"🔲 是否无窗口边框样式: {'✅' if result['has_no_border'] else '❌'}")
+    print(f"📐 尺寸是否匹配: {'✅' if result['size_match'] else '❌'}")
+    print(f"🎯 是否为全屏无边框窗口: {'✅' if result['is_fullscreen_borderless'] else '❌'}")
+    
+    # 如果是猛兽派对窗口，输出更详细的信息
+    if is_monster_party:
+        print(f"\n🎉 当前窗口是猛兽派对游戏窗口！")
+        if result['is_fullscreen_borderless']:
+            print("✨ 窗口为全屏无边框模式，符合要求！")
+        else:
+            if result['has_no_border']:
+                print("⚠️  窗口无边框，但尺寸不匹配")
+            elif result['size_match']:
+                print("⚠️  窗口尺寸匹配，但有边框")
+            else:
+                print("❌ 窗口既不是无边框也不是尺寸匹配")
+    else:
+        print(f"\n⏭️ 当前窗口不是猛兽派对游戏窗口")
+    
+    return result
+
+def auto_check_monster_party():
+    """
+    返回当前是否为猛兽派对窗口
+    
+    Returns:
+        bool: 当前是否为猛兽派对窗口
+    """
+    global is_monster_party_active
+    
+    # 不再执行自动检测，只返回当前状态
+    # 检测逻辑将只在软件启动和调试窗口点击时执行
+    return is_monster_party_active
 
 # 当前按下的修饰键状态
 current_modifiers = set()
@@ -3432,6 +4649,33 @@ def reload_templates_if_scale_changed():
             img = Image.open(jiashi_path)
             jiashi = scale_template(np.array(img), scale, scale)
 
+            # 放生稀有模板
+            release_xiyou_path = os.path.join(template_folder_path, "xiyou.png")
+            img = Image.open(release_xiyou_path)
+            # PIL 返回 RGB 格式，需要转换为 BGR 格式（OpenCV 默认格式）
+            release_xiyou = scale_template(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), scale, scale)
+
+            release_feifan_path = os.path.join(template_folder_path, "feifan.png")
+            img = Image.open(release_feifan_path)
+            # PIL 返回 RGB 格式，需要转换为 BGR 格式（OpenCV 默认格式）
+            release_feifan = scale_template(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), scale, scale)
+
+            release_shishi_path = os.path.join(template_folder_path, "shishi.png")
+            img = Image.open(release_shishi_path)
+            # PIL 返回 RGB 格式，需要转换为 BGR 格式（OpenCV 默认格式）
+            release_shishi = scale_template(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), scale, scale)
+
+            release_chuanshuo_path = os.path.join(template_folder_path, "chuanshuo.png")
+            img = Image.open(release_chuanshuo_path)
+            # PIL 返回 RGB 格式，需要转换为 BGR 格式（OpenCV 默认格式）
+            release_chuanshuo = scale_template(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), scale, scale)
+
+
+            # 放生鱼桶标签模板
+            release_bucket_label_path = os.path.join(template_folder_path, "bucket_label.png")
+            img = Image.open(release_bucket_label_path)
+            release_bucket_label = scale_template(np.array(img), scale, scale)
+
             print(f"✅ [模板] 所有模板重新加载完成，共 {len(templates)} 个数字模板 (统一缩放: {scale:.2f})")
         except Exception as e:
             print(f"❌ [错误] 重新加载模板失败: {e}")
@@ -3497,16 +4741,78 @@ def load_jiashi():
     scale = SCALE_UNIFORM
     jiashi = scale_template(template, scale, scale)
     return jiashi
+
+def load_release_xiyou():
+    global release_xiyou
+    if release_xiyou is None:
+        release_xiyou_path = os.path.join(template_folder_path, "xiyou.png")
+        img = Image.open(release_xiyou_path)
+        template = np.array(img)
+        # PIL 返回 RGB 格式，需要转换为 BGR 格式（OpenCV 默认格式）
+        template = cv2.cvtColor(template, cv2.COLOR_RGB2BGR)
+        scale = SCALE_UNIFORM
+        release_xiyou = scale_template(template, scale, scale)
+    return release_xiyou
+
+def load_release_feifan():
+    global release_feifan
+    if release_feifan is None:
+        release_feifan_path = os.path.join(template_folder_path, "feifan.png")
+        img = Image.open(release_feifan_path)
+        template = np.array(img)
+        # PIL 返回 RGB 格式，需要转换为 BGR 格式（OpenCV 默认格式）
+        template = cv2.cvtColor(template, cv2.COLOR_RGB2BGR)
+        scale = SCALE_UNIFORM
+        release_feifan = scale_template(template, scale, scale)
+    return release_feifan
+
+def load_release_shishi():
+    global release_shishi
+    if release_shishi is None:
+        release_shishi_path = os.path.join(template_folder_path, "shishi.png")
+        img = Image.open(release_shishi_path)
+        template = np.array(img)
+        # PIL 返回 RGB 格式，需要转换为 BGR 格式（OpenCV 默认格式）
+        template = cv2.cvtColor(template, cv2.COLOR_RGB2BGR)
+        scale = SCALE_UNIFORM
+        release_shishi = scale_template(template, scale, scale)
+    return release_shishi
+
+def load_release_chuanshuo():
+    global release_chuanshuo
+    if release_chuanshuo is None:
+        release_chuanshuo_path = os.path.join(template_folder_path, "chuanshuo.png")
+        img = Image.open(release_chuanshuo_path)
+        template = np.array(img)
+        # PIL 返回 RGB 格式，需要转换为 BGR 格式（OpenCV 默认格式）
+        template = cv2.cvtColor(template, cv2.COLOR_RGB2BGR)
+        scale = SCALE_UNIFORM
+        release_chuanshuo = scale_template(template, scale, scale)
+    return release_chuanshuo
+
 # =========================
 # 鼠标操作（使用 win32api 实现）
 # =========================
 mouse_lock = threading.Lock()
 mouse_is_down = False
 def pressandreleasemousebutton():
-    user32.mouse_event(0x02, 0, 0, 0, 0)
-    time.sleep(leftclickdown)
-    user32.mouse_event(0x04, 0, 0, 0, 0)
-    time.sleep(leftclickup)
+    # 根据开关状态决定是否应用随机延迟
+    if random_delay_enabled:
+        # 根据设置的百分比添加随机延迟
+        max_factor = 1.0 + random_delay / 100.0
+        random_factor_down = random.uniform(1.0, max_factor)
+        random_factor_up = random.uniform(1.0, max_factor)
+        
+        user32.mouse_event(0x02, 0, 0, 0, 0)
+        time.sleep(leftclickdown * random_factor_down)
+        user32.mouse_event(0x04, 0, 0, 0, 0)
+        time.sleep(leftclickup * random_factor_up)
+    else:
+        # 不使用随机延迟
+        user32.mouse_event(0x02, 0, 0, 0, 0)
+        time.sleep(leftclickdown)
+        user32.mouse_event(0x04, 0, 0, 0, 0)
+        time.sleep(leftclickup)
 
 def ensure_mouse_down():
     global mouse_is_down
@@ -3737,7 +5043,26 @@ def match_digit_template(image):
     return best_match
 
 def capture_region(x, y, w, h, scr):
-    region = (x, y,x+w,y+h)
+    # 获取主显示器信息，确保只在主显示器上截图
+    monitor = scr.monitors[1]  # 1 表示主显示器
+    
+    # 计算实际截图区域，确保在主显示器范围内
+    actual_x = x
+    actual_y = y
+    actual_w = w
+    actual_h = h
+    
+    # 确保区域在主显示器范围内
+    actual_x = max(monitor['left'], actual_x)
+    actual_y = max(monitor['top'], actual_y)
+    actual_x2 = min(monitor['left'] + monitor['width'], actual_x + actual_w)
+    actual_y2 = min(monitor['top'] + monitor['height'], actual_y + actual_h)
+    
+    # 重新计算宽度和高度，确保有效
+    actual_w = max(1, actual_x2 - actual_x)
+    actual_h = max(1, actual_y2 - actual_y)
+    
+    region = (actual_x, actual_y, actual_x2, actual_y2)
     frame = scr.grab(region)
     if frame is None:
         return None
@@ -3901,6 +5226,7 @@ def on_press(key):
 
     # 检查是否匹配热键
     check_hotkey_match(key)
+    check_release_hotkey_match(key)
 
 def on_release(key):
     global current_modifiers
@@ -3938,6 +5264,88 @@ def check_hotkey_match(key):
             toggle_run()  # 暂停或恢复程序
             return
 
+def check_release_hotkey_match(key):
+    """检查按键是否匹配放生热键"""
+    # 比较主按键
+    main_key_match = False
+    
+    # 直接比较按键对象
+    if key == release_hotkey_main_key:
+        main_key_match = True
+    # 字符键比较（忽略大小写）
+    elif hasattr(key, 'char') and hasattr(release_hotkey_main_key, 'char'):
+        if key.char and release_hotkey_main_key.char:
+            main_key_match = (key.char.lower() == release_hotkey_main_key.char.lower())
+    # 鼠标按键比较
+    elif isinstance(key, mouse.Button) and isinstance(release_hotkey_main_key, mouse.Button):
+        main_key_match = (key == release_hotkey_main_key)
+
+    if main_key_match:
+        # 检查修饰键是否匹配
+        if current_modifiers == release_hotkey_modifiers:
+            # 切换鱼桶识别线程的运行状态
+            if fish_bucket_run_event.is_set():
+                fish_bucket_run_event.clear()
+                print("🐟 [鱼桶] 识别线程已停止")
+            else:
+                fish_bucket_run_event.set()
+                print("🐟 [鱼桶] 识别线程已启动")
+            return
+            
+def detect_and_classify_templates(target_image, templates_dict, threshold=0.8):
+    """
+    在目标图像中检测并区分多个颜色变体的模板。
+    
+    参数：
+    - target_image: 目标图像（彩色 numpy 数组）
+    - templates_dict: 字典，键为颜色标签（e.g., 'red'），值为模板图像（彩色 numpy 数组）
+    - threshold: 相似度阈值 (0.0-1.0)
+    
+    返回：
+    - results: 字典，键为颜色标签，值为 {'count': int, 'locations': [(x, y, w, h), ...]}
+    """
+    results = {color: {'count': 0, 'locations': []} for color in templates_dict}
+    
+    # 转换为 HSV 用于颜色区分
+    target_hsv = cv2.cvtColor(target_image, cv2.COLOR_BGR2HSV)
+    
+    for color, template in templates_dict.items():
+        # 模板也转换为 HSV
+        template_hsv = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
+        
+        # 方法1: 灰度匹配位置（形状检测）
+        target_gray = cv2.cvtColor(target_image, cv2.COLOR_BGR2GRAY)
+        template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+        result = cv2.matchTemplate(target_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+        
+        # 获取潜在位置
+        loc = np.where(result >= threshold)
+        template_h, template_w = template_gray.shape[:2]
+        
+        # 方法2: 颜色验证（区分变体）
+        for pt in zip(*loc[::-1]):
+            x, y = pt
+            
+            # 提取目标区域的 HSV
+            roi_hsv = target_hsv[y:y + template_h, x:x + template_w]
+            
+            # 计算颜色相似度（e.g., 平均色调差异）
+            template_hue = np.mean(template_hsv[:, :, 0])  # 色调通道
+            roi_hue = np.mean(roi_hsv[:, :, 0])
+            hue_diff = abs(template_hue - roi_hue)
+            
+            # 如果色调差异小（<30），认为是匹配的颜色变体
+            if hue_diff < 15:  # 阈值可调
+                # 去重：检查重叠
+                overlap = any(abs(x - lx) < template_w // 2 and abs(y - ly) < template_h // 2 
+                             for lx, ly, _, _ in results[color]['locations'])
+                if not overlap:
+                    results[color]['locations'].append((x, y, template_w, template_h))
+        
+        results[color]['count'] = len(results[color]['locations'])
+    
+    return results
+
 def start_hotkey_listener():
     global listener, mouse_listener
     # 启动键盘监听器
@@ -3959,6 +5367,9 @@ def handle_jiashi_thread():
     global run_event, begin_event, previous_result, result_val_is
     while not begin_event.is_set():
         if run_event.is_set():
+            # 自动检测猛兽派对窗口
+            auto_check_monster_party()
+            
             try:
                 # 为每个线程创建独立的mss对象
                 scr = mss.mss()
@@ -3973,11 +5384,23 @@ def handle_jiashi_thread():
                         if fangzhu_jiashi(scr):
                             btn_x, btn_y = scale_point_center_anchored(*BTN_NO_JIASHI_BASE)
                             user32.SetCursorPos(btn_x, btn_y)
-                            time.sleep(0.05)
-                            user32.mouse_event(0x02, 0, 0, 0, 0)
-                            time.sleep(0.1)
-                            user32.mouse_event(0x04, 0, 0, 0, 0)
-                            time.sleep(0.05)
+                            if random_delay_enabled:
+                                # 根据设置的百分比添加随机延迟
+                                max_factor = 1.0 + random_delay / 100.0
+                                random_factor_short = random.uniform(1.0, max_factor)
+                                random_factor_medium = random.uniform(1.0, max_factor)
+                                time.sleep(0.05 * random_factor_short)
+                                user32.mouse_event(0x02, 0, 0, 0, 0)
+                                time.sleep(0.1 * random_factor_medium)
+                                user32.mouse_event(0x04, 0, 0, 0, 0)
+                                time.sleep(0.05 * random_factor_short)
+                            else:
+                                # 不使用随机延迟
+                                time.sleep(0.05)
+                                user32.mouse_event(0x02, 0, 0, 0, 0)
+                                time.sleep(0.1)
+                                user32.mouse_event(0x04, 0, 0, 0, 0)
+                                time.sleep(0.05)
                             if bait_math_val(scr):
                                 with param_lock:
                                     previous_result = result_val_is
@@ -3985,11 +5408,23 @@ def handle_jiashi_thread():
                         if fangzhu_jiashi(scr):
                             btn_x, btn_y = scale_point_center_anchored(*BTN_YES_JIASHI_BASE)
                             user32.SetCursorPos(btn_x, btn_y)
-                            time.sleep(0.05)
-                            user32.mouse_event(0x02, 0, 0, 0, 0)
-                            time.sleep(0.1)
-                            user32.mouse_event(0x04, 0, 0, 0, 0)
-                            time.sleep(0.05)
+                            if random_delay_enabled:
+                                # 根据设置的百分比添加随机延迟
+                                max_factor = 1.0 + random_delay / 100.0
+                                random_factor_short = random.uniform(1.0, max_factor)
+                                random_factor_medium = random.uniform(1.0, max_factor)
+                                time.sleep(0.05 * random_factor_short)
+                                user32.mouse_event(0x02, 0, 0, 0, 0)
+                                time.sleep(0.1 * random_factor_medium)
+                                user32.mouse_event(0x04, 0, 0, 0, 0)
+                                time.sleep(0.05 * random_factor_short)
+                            else:
+                                # 不使用随机延迟
+                                time.sleep(0.05)
+                                user32.mouse_event(0x02, 0, 0, 0, 0)
+                                time.sleep(0.1)
+                                user32.mouse_event(0x04, 0, 0, 0, 0)
+                                time.sleep(0.05)
                             if bait_math_val(scr):
                                 with param_lock:
                                     previous_result = result_val_is
@@ -4006,15 +5441,300 @@ def handle_jiashi_thread():
                     pass
         time.sleep(0.05)
 
+def handle_fish_bucket_thread():
+    """鱼桶区域识别线程 - F4触发时执行一次识别并显示结果"""
+    global fish_bucket_run_event, begin_event, release_xiyou
+    last_f4_state = False
+    
+    # 定义颜色类型和对应的HSV范围（基于色相和饱和度）
+    color_ranges = {
+        '传说': {'hue_range': (15, 25), 'saturation_range': (110, 125), 'color': (128, 128, 128), 'label': '传说'},  # 灰白色
+        '标准': {'hue_range': (55, 65), 'saturation_range': (20, 40), 'color': (0, 165, 255), 'label': '标准'},  # 金白色
+        '稀有': {'hue_range': (65, 75), 'saturation_range': (80, 95), 'color': (255, 0, 0), 'label': '稀有'},   # 蓝白色
+        '非凡': {'hue_range': (30, 40), 'saturation_range': (90, 100), 'color': (0, 255, 0), 'label': '非凡'},   # 绿白色
+        '史诗': {'hue_range': (80, 95), 'saturation_range': (90, 100), 'color': (255, 0, 255), 'label': '史诗'},  # 紫白色
+    }
+    
+    while not begin_event.is_set():
+        current_f4_state = fish_bucket_run_event.is_set()
+        
+        # 检测 F4 按下的上升沿（从未按下变为按下）
+        if current_f4_state and not last_f4_state:
+            break_all_loops = False  # 设置跳出循环的标志
+            try:
+                scr = mss.mss()
+                
+                if hasattr(scr, '_handles') and hasattr(scr._handles, 'srcdc') and scr._handles.srcdc is not None:
+                    
+                    if release_xiyou is not None:
+                        # FISH_BUCKET_REGION_BASE 格式是 (left, top, width, height)
+                        # 使用统一缩放比例缩放坐标
+                        scaled_x, scaled_y, scaled_w, scaled_h = scale_coords_uniform(*FISH_BUCKET_REGION_BASE)
+                        
+                        # 调试信息：打印坐标
+                        print(f"🐟 [鱼桶] 原始区域: {FISH_BUCKET_REGION_BASE}")
+                        print(f"🐟 [鱼桶] 缩放比例: {SCALE_UNIFORM:.2f}")
+                        print(f"🐟 [鱼桶] 缩放后区域: ({scaled_x}, {scaled_y}, {scaled_w}, {scaled_h})")
+                        print(f"🐟 [鱼桶] 屏幕尺寸: {user32.GetSystemMetrics(0)}x{user32.GetSystemMetrics(1)}")
+                        
+                        # 检查缩放后的坐标是否有效
+                        if scaled_w <= 0 or scaled_h <= 0:
+                            print(f"❌ [鱼桶] 缩放后的区域宽度或高度无效: ({scaled_x}, {scaled_y}, {scaled_w}, {scaled_h})")
+                        elif scaled_x < 0 or scaled_y < 0:
+                            print(f"❌ [鱼桶] 缩放后的区域坐标为负: ({scaled_x}, {scaled_y}, {scaled_w}, {scaled_h})")
+                        elif (scaled_x + scaled_w > user32.GetSystemMetrics(0) or 
+                              scaled_y + scaled_h > user32.GetSystemMetrics(1)):
+                            print(f"❌ [鱼桶] 缩放后的区域超出屏幕范围: ({scaled_x}, {scaled_y}, {scaled_w}, {scaled_h})")
+                        else:
+                            # 使用字典格式捕获鱼桶区域
+                            bucket_frame = scr.grab({
+                                "left": scaled_x,
+                                "top": scaled_y,
+                                "width": scaled_w,
+                                "height": scaled_h
+                            })
+                            
+                            if bucket_frame is not None:
+                                # 弹窗显示截取的图片，1秒后自动关闭
+                                try:
+                                    # 将mss截取的图像转换为NumPy数组 (BGRA格式）
+                                    preview_img = np.array(bucket_frame)
+                                    # 转换为BGR格式用于显示
+                                    preview_img_bgr = cv2.cvtColor(preview_img, cv2.COLOR_BGRA2BGR)
+                                    # 显示图片
+                                    cv2.imshow("截取的鱼桶区域", preview_img_bgr)
+                                    # 等待1秒后自动关闭
+                                    cv2.waitKey(1000)
+                                    # 销毁窗口
+                                    cv2.destroyWindow("截取的鱼桶区域")
+                                except Exception as e:
+                                    print(f"⚠️  [鱼桶] 图片预览出错: {e}")
+                            
+                            if bucket_frame is not None:
+                                # 将mss截取的图像转换为NumPy数组 (BGRA格式）
+                                bucket_img = np.array(bucket_frame)
+                                
+                                # 检查图像是否有效
+                                if bucket_img.size > 0:
+                                    # 转换为BGR格式（mss返回BGRA，不是RGBA）
+                                    bucket_img_bgr = cv2.cvtColor(bucket_img, cv2.COLOR_BGRA2BGR)
+                                    
+                                    # 转换为灰度图像用于形状匹配
+                                    bucket_img_gray = cv2.cvtColor(bucket_img_bgr, cv2.COLOR_BGR2GRAY)
+                                    template_gray = cv2.cvtColor(release_xiyou, cv2.COLOR_BGR2GRAY)
+                                    
+                                    # 使用灰度模板匹配找到所有形状
+                                    result = cv2.matchTemplate(bucket_img_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+                                    loc = np.where(result >= 0.9)  # 阈值
+                                    
+                                    template_h, template_w = template_gray.shape[:2]
+                                    
+                                    # 转换为HSV用于颜色分析
+                                    bucket_img_hsv = cv2.cvtColor(bucket_img_bgr, cv2.COLOR_BGR2HSV)
+                                    
+                                    # 存储所有检测到的结果
+                                    all_results = {color_type: {'count': 0, 'locations': []} for color_type in color_ranges}
+                                    
+                                    # 遍历所有检测到的位置
+                                    for pt in zip(*loc[::-1]):
+                                        if break_all_loops:
+                                            break
+                                        
+                                        x, y = pt
+                                        
+                                        # 提取目标区域的HSV
+                                        roi_hsv = bucket_img_hsv[y:y + template_h, x:x + template_w]
+                                        
+                                        # 计算平均色相和饱和度
+                                        avg_hue = np.mean(roi_hsv[:, :, 0])
+                                        avg_saturation = np.mean(roi_hsv[:, :, 1])
+                                        
+                                        # 调试：打印前几个位置的HSV值
+                                        try:
+                                            total_count = (all_results.get('稀有', {}).get('count', 0) + 
+                                                         all_results.get('标准', {}).get('count', 0) + 
+                                                         all_results.get('非凡', {}).get('count', 0) + 
+                                                         all_results.get('史诗', {}).get('count', 0) + 
+                                                         all_results.get('传说', {}).get('count', 0))
+                                            if total_count < 5:
+                                                print(f"   位置({x}, {y}) - 色相: {avg_hue:.1f}, 饱和度: {avg_saturation:.1f}")
+                                        except Exception as e:
+                                            print(f"   调试信息打印错误: {e}")
+                                        
+                                        # 根据色相和饱和度判断颜色类型
+                                        detected_type = None
+                                        for color_type, color_info in color_ranges.items():
+                                            if break_all_loops:
+                                                break
+                                            hue_min, hue_max = color_info['hue_range']
+                                            sat_min, sat_max = color_info['saturation_range']
+                                            
+                                            # 检查色相和饱和度是否在范围内
+                                            if hue_min <= avg_hue <= hue_max and sat_min <= avg_saturation <= sat_max:
+                                                detected_type = color_type
+                                                break
+                                        
+                                        # 如果没有匹配到颜色，默认为标准
+                                        if detected_type is None:
+                                            detected_type = '标准'
+                                        
+                                        # 检查是否在选中的品质列表中
+                                        global selected_qualitys
+                                        if detected_type in selected_qualitys:
+                                            screen_x = scaled_x + x
+                                            screen_y = scaled_y + y
+                                            
+                                            # 鼠标移动到目标位置（确保坐标为整数）
+                                            user32.SetCursorPos(int(screen_x), int(screen_y))
+                                            
+                                            # 鼠标单击操作（考虑随机延迟）
+                                            if random_delay_enabled:
+                                                time.sleep(0.05 * 1.5)
+                                                user32.mouse_event(0x02, 0, 0, 0, 0)  # 左键按下
+                                                time.sleep(0.1 * 1.5)
+                                                user32.mouse_event(0x04, 0, 0, 0, 0)  # 左键释放
+                                                time.sleep(0.05 * 1.5)
+                                            else:
+                                                # 不使用随机延迟
+                                                time.sleep(0.05)
+                                                user32.mouse_event(0x02, 0, 0, 0, 0)  # 左键按下
+                                                time.sleep(0.1)
+                                                user32.mouse_event(0x04, 0, 0, 0, 0)  # 左键释放
+                                                time.sleep(0.05)
+                                            
+                                            if screen_x >= 2290:
+                                                screen_x = screen_x - 160
+                                            else:
+                                                screen_x = screen_x + 160
+                                            if screen_y >= 960:
+                                                screen_y = screen_y - 120
+                                            else:
+                                                screen_y = screen_y + 140
+                                            # 鼠标移动到目标位置（确保坐标为整数）
+                                            user32.SetCursorPos(int(screen_x), int(screen_y))
+                                            time.sleep(0.1)
+                                            # 鼠标单击操作（考虑随机延迟）
+                                            if random_delay_enabled:
+                                                time.sleep(0.05 * 1.5)
+                                                user32.mouse_event(0x02, 0, 0, 0, 0)  # 左键按下
+                                                time.sleep(0.1 * 1.5)
+                                                user32.mouse_event(0x04, 0, 0, 0, 0)  # 左键释放
+                                                time.sleep(0.05 * 1.5)
+                                            else:
+                                                # 不使用随机延迟
+                                                time.sleep(0.05)
+                                                user32.mouse_event(0x02, 0, 0, 0, 0)  # 左键按下
+                                                time.sleep(0.1)
+                                                user32.mouse_event(0x04, 0, 0, 0, 0)  # 左键释放
+                                                time.sleep(0.05)
+                                            
+                                            # 执行完成后设置标志并跳出当前循环
+                                            user32.SetCursorPos(1986, 450)
+                                            time.sleep(0.5)
+                                            break_all_loops = True
+                                            break
+                                    
+                                    # 如果已经找到并处理了目标鱼，直接跳回到F4状态检查
+                                    if break_all_loops:
+                                        continue
+
+
+                                    # # 遍历所有识别结果
+                                    # for color_type, result in all_results.items():
+                                    #     if result['count'] > 0:
+                                    #         color = color_ranges[color_type]['color']
+                                    #         label = color_ranges[color_type]['label']
+                                    #         print(f"🐟 [鱼桶] 检测到 {result['count']} 个{label}")
+                                            
+                                    #         # 计算屏幕上的绝对位置并更新到 result 中
+                                    #         updated_locations = []
+                                    #         for x, y, w, h in result['locations']:
+                                    #             # 计算屏幕上的绝对位置
+                                    #             screen_x = scaled_x + x
+                                    #             screen_y = scaled_y + y
+                                                
+                                    #             # 打印相对位置和绝对位置
+                                    #             print(f"   相对位置: ({x}, {y}, {w}, {h})")
+                                    #             print(f"   绝对位置: ({screen_x}, {screen_y}, {w}, {h})")
+                                                
+                                    #             # 使用对应的颜色绘制矩形框
+                                    #             cv2.rectangle(display_img, (x, y), (x + w, y + h), color, 2)
+                                                
+                                    #             # 在框内添加品质标签
+                                    #             # 使用PIL绘制中文文字（OpenCV默认字体不支持中文）
+                                                
+                                    #             # 将OpenCV图像转换为PIL图像
+                                    #             display_img_pil = Image.fromarray(cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB))
+                                    #             draw = ImageDraw.Draw(display_img_pil)
+                                                
+                                    #             # 设置字体
+                                    #             font_path = "C:\\Windows\\Fonts\\simsun.ttc"
+                                    #             font_size = 12
+                                    #             font = ImageFont.truetype(font_path, font_size)
+                                                
+                                    #             text = label
+                                    #             text_color = (255, 255, 255)  # 白色文字
+                                                
+                                    #             # 计算文字位置（左上角）
+                                    #             text_x = x + 3
+                                    #             text_y = y + 3  # 向下偏移3像素
+                                                
+                                    #             # 在框内绘制文字
+                                    #             draw.text((text_x, text_y), text, font=font, fill=text_color)
+                                                
+                                    #             # 将PIL图像转换回OpenCV图像
+                                    #             display_img = cv2.cvtColor(np.array(display_img_pil), cv2.COLOR_RGB2BGR)
+                                                
+                                    #             # 保存绝对位置到列表中
+                                    #             updated_locations.append((screen_x, screen_y, w, h))
+                                            
+                                    #         # 更新 result 中的 locations 为屏幕绝对位置
+                                    #         result['locations'] = updated_locations
+                                    
+                                    # # 弹窗显示带标记框的图像
+                                    # cv2.imshow("鱼桶识别结果", display_img)
+                                    # cv2.waitKey(0)
+                                    # cv2.destroyAllWindows()
+                                else:
+                                    print("⚠️  [鱼桶] 捕获的图像无效")
+                    else:
+                        print("⚠️  [鱼桶] release_xiyou 模板加载失败")
+                
+                scr.close()
+            except Exception as e:
+                print(f"❌ [错误] 鱼桶线程异常: {e}")
+                import traceback
+                traceback.print_exc()
+                try:
+                    if 'scr' in locals() and scr is not None:
+                        scr.close()
+                except:
+                    pass
+        
+        last_f4_state = current_f4_state
+        time.sleep(0.1)
+
 def main():
     global templates, template_folder_path, current_result, previous_result, times, a, region1, region2, result_val_is, scr, jiashi_var
 
     # 启动加时处理线程
     jiashi_thread = threading.Thread(target=handle_jiashi_thread, daemon=True)
     jiashi_thread.start()
+    
+    # 加载 release_xiyou 模板
+    load_release_xiyou()
+    # load_release_chuanshuo()
+    # load_release_feifan()
+    # load_release_shishi()
+    # 启动鱼桶区域识别线程
+    fish_bucket_thread = threading.Thread(target=handle_fish_bucket_thread, daemon=True)
+    fish_bucket_thread.start()
 
     while not begin_event.is_set():
         if run_event.is_set():
+            # 自动检测猛兽派对窗口
+            auto_check_monster_party()
+            
             scr = None
             try:
                 scr = mss.mss()
@@ -4022,12 +5742,24 @@ def main():
                 # 检测F1/F2抛竿
                 if f1_mached(scr):
                     user32.mouse_event(0x02, 0, 0, 0, 0)
-                    time.sleep(paogantime)
+                    if random_delay_enabled:
+                        # 根据设置的百分比添加随机延迟
+                        max_factor = 1.0 + random_delay / 100.0
+                        random_factor_paogantime = random.uniform(1.0, max_factor)
+                        time.sleep(paogantime * random_factor_paogantime)
+                    else:
+                        time.sleep(paogantime)
                     user32.mouse_event(0x04, 0, 0, 0, 0)
                     time.sleep(0.15)
                 elif f2_mached(scr):
                     user32.mouse_event(0x02, 0, 0, 0, 0)
-                    time.sleep(paogantime)
+                    if random_delay_enabled:
+                        # 根据设置的百分比添加随机延迟
+                        max_factor = 1.0 + random_delay / 100.0
+                        random_factor_paogantime = random.uniform(1.0, max_factor)
+                        time.sleep(paogantime * random_factor_paogantime)
+                    else:
+                        time.sleep(paogantime)
                     user32.mouse_event(0x04, 0, 0, 0, 0)
                     time.sleep(0.15)
                 elif shangyu_mached(scr):
@@ -4091,13 +5823,23 @@ def main():
 # 程序入口
 # =========================
 if __name__ == "__main__":
+    # 管理员权限检测
+    print("🔒 [初始化] 正在检测管理员权限...")
+    if not is_admin():
+        print("⚠️  [警告] 当前程序未以管理员权限运行")
+        print("📋 [提示] 请右键点击程序图标，选择'以管理员身份运行'，以确保所有功能正常工作")
+        print("💡 [说明] 管理员权限对于键盘鼠标模拟、截图等功能至关重要")
+        print()
+    else:
+        print("✅ [初始化] 管理员权限检测通过")
+        print()
+    
     # 先加载参数以获取热键设置
     load_parameters()
 
-    print()
     print("╔" + "═" * 50 + "╗")
     print("║" + " " * 50 + "║")
-    print("║     🎣  PartyFish 自动钓鱼助手  v2.7             ║")
+    print("║     🎣  PartyFish 自动钓鱼助手  v2.8             ║")
     print("║" + " " * 50 + "║")
     print("╠" + "═" * 50 + "╣")
     print(f"║  📺 当前分辨率: {CURRENT_SCREEN_WIDTH}×{CURRENT_SCREEN_HEIGHT}".ljust(45)+"║")
